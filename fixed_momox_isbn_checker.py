@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import socket
 from dataclasses import dataclass, asdict
@@ -116,18 +117,82 @@ def parse_offer_page(html: str, isbn: str, url: str) -> OfferResult:
     return OfferResult(isbn, url, False, None, title, "PARSE_FAIL")
 
 
-async def quick_connect_test(session: aiohttp.ClientSession) -> str:
+async def fetch_html_with_playwright(url: str, proxy: Optional[str] = None) -> Tuple[Optional[str], str]:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return None, "PLAYWRIGHT_NOT_AVAILABLE"
+
+    async def attempt(with_proxy: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        launch_options = {"headless": True, "args": ["--no-sandbox"]}
+        if with_proxy:
+            launch_options["proxy"] = {"server": with_proxy}
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(**launch_options)
+                context = await browser.new_context(
+                    user_agent=BASE_HEADERS["User-Agent"],
+                    locale="fr-FR",
+                    extra_http_headers={
+                        "Accept": BASE_HEADERS["Accept"],
+                        "Accept-Language": BASE_HEADERS["Accept-Language"],
+                    },
+                )
+                page = await context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000, referer="https://www.momox.fr/")
+                content = await page.content()
+                await browser.close()
+                return content, None
+        except Exception as exc:
+            message = str(exc).splitlines()[0]
+            return None, f"PLAYWRIGHT_{type(exc).__name__}:{message}"
+
+    html, error = await attempt(proxy)
+    if html is not None:
+        return html, "OK"
+    if proxy:
+        html, fallback_error = await attempt(None)
+        if html is not None:
+            return html, "OK"
+        if fallback_error:
+            return None, fallback_error
+    return None, error or "PLAYWRIGHT_UNKNOWN_ERROR"
+
+
+async def quick_connect_test(session: aiohttp.ClientSession, proxy: Optional[str]) -> str:
     """Test simple pour voir si on atteint momox."""
     test_url = BASE_URL.format("9782070368228")
     try:
-        async with session.get(test_url, headers=BASE_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(
+            test_url,
+            headers=BASE_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+            proxy=proxy,
+        ) as resp:
             return f"CONNECT_OK_HTTP_{resp.status}"
+    except aiohttp.ClientHttpProxyError:
+        return "CONNECT_ERROR_ClientHttpProxyError"
+    except aiohttp.ClientProxyConnectionError:
+        return "CONNECT_ERROR_ClientProxyConnectionError"
     except aiohttp.ClientConnectorError:
         return "CONNECT_ERROR_ClientConnectorError"
     except asyncio.TimeoutError:
         return "CONNECT_ERROR_TIMEOUT"
     except aiohttp.ClientError as e:
         return f"CONNECT_ERROR_{type(e).__name__}"
+
+
+def resolve_proxy(proxy: Optional[str], use_env_proxy: bool) -> Optional[str]:
+    if proxy:
+        return proxy
+    if not use_env_proxy:
+        return None
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
 
 
 async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str]) -> None:
@@ -149,6 +214,7 @@ async def fetch_html_with_retries(
     url: str,
     retries: int = 3,
     proxy: Optional[str] = None,
+    use_playwright_fallback: bool = True,
 ) -> Tuple[Optional[str], str]:
     """
     Télécharge le HTML avec plusieurs tentatives. Sur certaines infrastructures,
@@ -165,39 +231,55 @@ async def fetch_html_with_retries(
     if "//www." in url:
         variants.append(url.replace("//www.", "//"))
 
-    for variant in variants:
-        for attempt in range(1, retries + 1):
-            try:
-                headers = dict(BASE_HEADERS)
-                headers["Referer"] = "https://www.momox.fr/"
-                async with session.get(
-                    variant,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=25),
-                    proxy=proxy,
-                ) as resp:
-                    last_status = f"HTTP_{resp.status}"
-                    if resp.status in {403, 429}:
-                        await warmup_session(session, proxy)
+    proxies = [proxy] if proxy else [None]
+    if proxy:
+        proxies.append(None)
+
+    for current_proxy in proxies:
+        for variant in variants:
+            for attempt in range(1, retries + 1):
+                try:
+                    headers = dict(BASE_HEADERS)
+                    headers["Referer"] = "https://www.momox.fr/"
+                    async with session.get(
+                        variant,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=25),
+                        proxy=current_proxy,
+                    ) as resp:
+                        last_status = f"HTTP_{resp.status}"
+                        if resp.status in {403, 429}:
+                            await warmup_session(session, current_proxy)
+                            await asyncio.sleep(0.6 * attempt)
+                            continue
+                        # on accepte les codes 200
+                        if resp.status == 200:
+                            return await resp.text(), "OK"
+                        # Si 3xx ou 4xx, on considère qu'il y a un blocage temporaire;
+                        # on attend un peu avant de réessayer ou de passer au variant suivant.
                         await asyncio.sleep(0.6 * attempt)
                         continue
-                    # on accepte les codes 200
-                    if resp.status == 200:
-                        return await resp.text(), "OK"
-                    # Si 3xx ou 4xx, on considère qu'il y a un blocage temporaire;
-                    # on attend un peu avant de réessayer ou de passer au variant suivant.
-                    await asyncio.sleep(0.6 * attempt)
-                    continue
-            except asyncio.TimeoutError:
-                last_status = "TIMEOUT"
-            except aiohttp.ClientConnectorError:
-                last_status = "CONNECT_ERROR"
-            except aiohttp.ClientError:
-                last_status = "CLIENT_ERROR"
+                except asyncio.TimeoutError:
+                    last_status = "TIMEOUT"
+                except aiohttp.ClientHttpProxyError:
+                    last_status = "PROXY_ERROR"
+                except aiohttp.ClientProxyConnectionError:
+                    last_status = "PROXY_CONNECT_ERROR"
+                except aiohttp.ClientConnectorError:
+                    last_status = "CONNECT_ERROR"
+                except aiohttp.ClientError:
+                    last_status = "CLIENT_ERROR"
 
-            # backoff
-            await asyncio.sleep(0.6 * attempt)
-        # Si on atteint ici, tentative échouée pour ce variant; on passe au suivant
+                # backoff
+                await asyncio.sleep(0.6 * attempt)
+            # Si on atteint ici, tentative échouée pour ce variant; on passe au suivant
+
+    if use_playwright_fallback:
+        html, pw_status = await fetch_html_with_playwright(url, proxy=proxy)
+        if html is not None:
+            return html, pw_status
+        if pw_status != "PLAYWRIGHT_NOT_AVAILABLE":
+            return None, pw_status
 
     return None, last_status
 
@@ -207,12 +289,19 @@ async def fetch_one(
     isbn: str,
     sem: asyncio.Semaphore,
     proxy: Optional[str] = None,
+    use_playwright_fallback: bool = True,
 ) -> OfferResult:
     isbn = normalize_isbn(isbn)
     url = BASE_URL.format(isbn)
 
     async with sem:
-        html, status = await fetch_html_with_retries(session, url, retries=3, proxy=proxy)
+        html, status = await fetch_html_with_retries(
+            session,
+            url,
+            retries=3,
+            proxy=proxy,
+            use_playwright_fallback=use_playwright_fallback,
+        )
 
     if html is None:
         return OfferResult(isbn, url, False, None, None, status)
@@ -224,9 +313,11 @@ async def run(
     isbns: List[str],
     concurrency: int = 4,
     proxy: Optional[str] = None,
-    use_env_proxy: bool = False,
+    use_env_proxy: bool = True,
+    use_playwright_fallback: bool = True,
 ) -> List[OfferResult]:
     sem = asyncio.Semaphore(concurrency)
+    resolved_proxy = resolve_proxy(proxy, use_env_proxy)
 
     # Le fix principal: forcer IPv4 (évite beaucoup de ClientConnectorError sur certains réseaux)
     connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
@@ -236,13 +327,13 @@ async def run(
         trust_env=use_env_proxy,
         cookie_jar=aiohttp.CookieJar(unsafe=True),
     ) as session:
-        await warmup_session(session, proxy)
+        await warmup_session(session, resolved_proxy)
         # Diagnostic rapide
-        diag = await quick_connect_test(session)
+        diag = await quick_connect_test(session, resolved_proxy)
         print(f"[DIAG] {diag} (si CONNECT_ERROR: réseau/DNS/filtrage probable)")
 
         tasks = [
-            fetch_one(session, isbn, sem, proxy=proxy)
+            fetch_one(session, isbn, sem, proxy=resolved_proxy, use_playwright_fallback=use_playwright_fallback)
             for isbn in isbns
             if normalize_isbn(isbn)
         ]

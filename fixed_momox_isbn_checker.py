@@ -11,7 +11,7 @@ import pandas as pd
 
 BASE_URL = "https://www.momox.fr/offer/{}"
 
-HEADERS = {
+BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -21,6 +21,14 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-CH-UA": '"Chromium";v="120", "Not-A.Brand";v="24", "Google Chrome";v="120"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Linux"',
+    "DNT": "1",
 }
 
 
@@ -112,7 +120,7 @@ async def quick_connect_test(session: aiohttp.ClientSession) -> str:
     """Test simple pour voir si on atteint momox."""
     test_url = BASE_URL.format("9782070368228")
     try:
-        async with session.get(test_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(test_url, headers=BASE_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             return f"CONNECT_OK_HTTP_{resp.status}"
     except aiohttp.ClientConnectorError:
         return "CONNECT_ERROR_ClientConnectorError"
@@ -127,7 +135,7 @@ async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str]) -
     try:
         async with session.get(
             "https://www.momox.fr/",
-            headers=HEADERS,
+            headers=BASE_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
             proxy=proxy,
         ):
@@ -160,9 +168,11 @@ async def fetch_html_with_retries(
     for variant in variants:
         for attempt in range(1, retries + 1):
             try:
+                headers = dict(BASE_HEADERS)
+                headers["Referer"] = "https://www.momox.fr/"
                 async with session.get(
                     variant,
-                    headers=HEADERS,
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=25),
                     proxy=proxy,
                 ) as resp:
@@ -221,7 +231,12 @@ async def run(
     # Le fix principal: forcer IPv4 (évite beaucoup de ClientConnectorError sur certains réseaux)
     connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
 
-    async with aiohttp.ClientSession(connector=connector, trust_env=use_env_proxy) as session:
+    async with aiohttp.ClientSession(
+        connector=connector,
+        trust_env=use_env_proxy,
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+    ) as session:
+        await warmup_session(session, proxy)
         # Diagnostic rapide
         diag = await quick_connect_test(session)
         print(f"[DIAG] {diag} (si CONNECT_ERROR: réseau/DNS/filtrage probable)")

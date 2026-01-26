@@ -187,6 +187,8 @@ def resolve_proxy(proxy: Optional[str], use_env_proxy: bool) -> Optional[str]:
         return proxy
     if not use_env_proxy:
         return None
+    if os.environ.get("MOMOX_NO_PROXY", "").strip().lower() in {"1", "true", "yes"}:
+        return None
     return (
         os.environ.get("HTTPS_PROXY")
         or os.environ.get("https_proxy")
@@ -313,7 +315,7 @@ async def run(
     isbns: List[str],
     concurrency: int = 4,
     proxy: Optional[str] = None,
-    use_env_proxy: bool = True,
+    use_env_proxy: bool = False,
     use_playwright_fallback: bool = True,
 ) -> List[OfferResult]:
     sem = asyncio.Semaphore(concurrency)

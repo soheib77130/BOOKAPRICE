@@ -1,8 +1,9 @@
 import asyncio
+import json
 import re
 import socket
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -15,7 +16,11 @@ HEADERS = {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -42,12 +47,34 @@ def extract_price_eur(text: str) -> Optional[float]:
     return float(m.group(1).replace(",", "."))
 
 
+def extract_json_ld_price(soup: BeautifulSoup) -> Optional[float]:
+    scripts = soup.find_all("script", {"type": "application/ld+json"})
+    for script in scripts:
+        raw = script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            offers = item.get("offers") if isinstance(item, dict) else None
+            if isinstance(offers, dict):
+                price = offers.get("price")
+                try:
+                    return float(str(price).replace(",", "."))
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
 def parse_offer_page(html: str, isbn: str, url: str) -> OfferResult:
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(strip=True) if soup.title else None
 
     text_all = soup.get_text(" ", strip=True)
-    price = extract_price_eur(text_all)
+    price = extract_json_ld_price(soup) or extract_price_eur(text_all)
 
     lowered = text_all.lower()
     negative_markers = [
@@ -95,7 +122,26 @@ async def quick_connect_test(session: aiohttp.ClientSession) -> str:
         return f"CONNECT_ERROR_{type(e).__name__}"
 
 
-async def fetch_html_with_retries(session: aiohttp.ClientSession, url: str, retries: int = 3) -> (Optional[str], str):
+async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str]) -> None:
+    """Prépare la session en visitant la page d'accueil pour récupérer les cookies."""
+    try:
+        async with session.get(
+            "https://www.momox.fr/",
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+            proxy=proxy,
+        ):
+            return
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return
+
+
+async def fetch_html_with_retries(
+    session: aiohttp.ClientSession,
+    url: str,
+    retries: int = 3,
+    proxy: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
     """
     Télécharge le HTML avec plusieurs tentatives. Sur certaines infrastructures,
     la résolution DNS ou le filtrage peut causer des erreurs de connexion. Cette
@@ -118,8 +164,13 @@ async def fetch_html_with_retries(session: aiohttp.ClientSession, url: str, retr
                     variant,
                     headers=HEADERS,
                     timeout=aiohttp.ClientTimeout(total=25),
+                    proxy=proxy,
                 ) as resp:
                     last_status = f"HTTP_{resp.status}"
+                    if resp.status in {403, 429}:
+                        await warmup_session(session, proxy)
+                        await asyncio.sleep(0.6 * attempt)
+                        continue
                     # on accepte les codes 200
                     if resp.status == 200:
                         return await resp.text(), "OK"
@@ -141,12 +192,17 @@ async def fetch_html_with_retries(session: aiohttp.ClientSession, url: str, retr
     return None, last_status
 
 
-async def fetch_one(session: aiohttp.ClientSession, isbn: str, sem: asyncio.Semaphore) -> OfferResult:
+async def fetch_one(
+    session: aiohttp.ClientSession,
+    isbn: str,
+    sem: asyncio.Semaphore,
+    proxy: Optional[str] = None,
+) -> OfferResult:
     isbn = normalize_isbn(isbn)
     url = BASE_URL.format(isbn)
 
     async with sem:
-        html, status = await fetch_html_with_retries(session, url, retries=3)
+        html, status = await fetch_html_with_retries(session, url, retries=3, proxy=proxy)
 
     if html is None:
         return OfferResult(isbn, url, False, None, None, status)
@@ -154,26 +210,27 @@ async def fetch_one(session: aiohttp.ClientSession, isbn: str, sem: asyncio.Sema
     return parse_offer_page(html, isbn, url)
 
 
-async def run(isbns: List[str], concurrency: int = 4, proxy: Optional[str] = None) -> List[OfferResult]:
+async def run(
+    isbns: List[str],
+    concurrency: int = 4,
+    proxy: Optional[str] = None,
+    use_env_proxy: bool = False,
+) -> List[OfferResult]:
     sem = asyncio.Semaphore(concurrency)
 
     # Le fix principal: forcer IPv4 (évite beaucoup de ClientConnectorError sur certains réseaux)
     connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
 
-    # "trust_env=True" permet à aiohttp de prendre en compte les variables
-    # d'environnement HTTP(S)_PROXY utilisées dans certains environnements (comme
-    # celui de ce script). Sans cette option, la résolution DNS peut échouer et
-    # entraîner des erreurs ClientConnectorError.
-    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+    async with aiohttp.ClientSession(connector=connector, trust_env=use_env_proxy) as session:
         # Diagnostic rapide
         diag = await quick_connect_test(session)
         print(f"[DIAG] {diag} (si CONNECT_ERROR: réseau/DNS/filtrage probable)")
 
-        # Si tu as un proxy HTTP(S) à utiliser, tu peux le passer en argument (voir plus bas)
-        if proxy:
-            session._default_headers.update({"Proxy": proxy})  # non bloquant, informatif
-
-        tasks = [fetch_one(session, isbn, sem) for isbn in isbns if normalize_isbn(isbn)]
+        tasks = [
+            fetch_one(session, isbn, sem, proxy=proxy)
+            for isbn in isbns
+            if normalize_isbn(isbn)
+        ]
         return await asyncio.gather(*tasks)
 
 

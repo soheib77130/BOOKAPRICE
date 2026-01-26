@@ -16,7 +16,11 @@ HEADERS = {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -118,6 +122,20 @@ async def quick_connect_test(session: aiohttp.ClientSession) -> str:
         return f"CONNECT_ERROR_{type(e).__name__}"
 
 
+async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str]) -> None:
+    """Prépare la session en visitant la page d'accueil pour récupérer les cookies."""
+    try:
+        async with session.get(
+            "https://www.momox.fr/",
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+            proxy=proxy,
+        ):
+            return
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return
+
+
 async def fetch_html_with_retries(
     session: aiohttp.ClientSession,
     url: str,
@@ -149,6 +167,10 @@ async def fetch_html_with_retries(
                     proxy=proxy,
                 ) as resp:
                     last_status = f"HTTP_{resp.status}"
+                    if resp.status in {403, 429}:
+                        await warmup_session(session, proxy)
+                        await asyncio.sleep(0.6 * attempt)
+                        continue
                     # on accepte les codes 200
                     if resp.status == 200:
                         return await resp.text(), "OK"

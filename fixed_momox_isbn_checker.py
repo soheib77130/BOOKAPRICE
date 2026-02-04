@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.momox.fr/offer/{}"
+JINA_AI_BASE = "https://r.jina.ai/http://{}"
+DEFAULT_API_BASE = "https://www.momox.fr/api/v4"
+DEFAULT_API_HOST = "https://api.momox.de/api/v4"
+DEFAULT_MARKETPLACE_ID = "momox_fr"
 
 BASE_HEADERS = {
     "User-Agent": (
@@ -126,6 +130,16 @@ def parse_offer_page(html: str, isbn: str, url: str) -> OfferResult:
         return OfferResult(isbn, url, True, None, title, "OK_SANS_PRIX")
 
     return OfferResult(isbn, url, False, None, title, "PARSE_FAIL")
+
+
+def extract_api_base(html: str) -> Optional[str]:
+    match = re.search(r'MX_WEBAPP\.apiUrl\s*=\s*"([^"]+)"', html)
+    if not match:
+        return None
+    api_url = match.group(1)
+    if api_url.startswith("/"):
+        return f"https://www.momox.fr{api_url}"
+    return api_url
 
 
 async def fetch_html_with_playwright(url: str, proxy: Optional[str] = None) -> Tuple[Optional[str], str]:
@@ -238,6 +252,7 @@ async def fetch_html_with_retries(
     retries: int = 3,
     proxy: Optional[str] = None,
     use_playwright_fallback: bool = True,
+    use_jina_fallback: bool = False,
 ) -> Tuple[Optional[str], str]:
     """
     Télécharge le HTML avec plusieurs tentatives. Sur certaines infrastructures,
@@ -305,7 +320,103 @@ async def fetch_html_with_retries(
         if pw_status != "PLAYWRIGHT_NOT_AVAILABLE":
             return None, pw_status
 
+    if use_jina_fallback:
+        jina_url = JINA_AI_BASE.format(url.replace("https://", "").replace("http://", ""))
+        try:
+            async with session.get(
+                jina_url,
+                headers=BASE_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+                proxy=proxy,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.text(), "OK_JINA"
+                return None, f"HTTP_JINA_{resp.status}"
+        except asyncio.TimeoutError:
+            return None, "TIMEOUT_JINA"
+        except aiohttp.ClientError:
+            return None, "CLIENT_ERROR_JINA"
+
     return None, last_status
+
+
+def _extract_price_from_json(payload: object) -> Optional[float]:
+    price_keys = {
+        "price",
+        "offerPrice",
+        "offer_price",
+        "purchasePrice",
+        "buyPrice",
+        "priceEur",
+    }
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in price_keys:
+                try:
+                    return float(str(value).replace(",", "."))
+                except (TypeError, ValueError):
+                    pass
+            nested = _extract_price_from_json(value)
+            if nested is not None:
+                return nested
+    elif isinstance(payload, list):
+        for item in payload:
+            nested = _extract_price_from_json(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _build_api_endpoints(base: str, isbn: str) -> List[str]:
+    base = base.rstrip("/")
+    return [
+        f"{base}/offer/{isbn}",
+        f"{base}/offer?ean={isbn}",
+        f"{base}/offer?isbn={isbn}",
+        f"{base}/offers/{isbn}",
+        f"{base}/offers?ean={isbn}",
+        f"{base}/media/offer/{isbn}",
+        f"{base}/media/offer?ean={isbn}",
+    ]
+
+
+def _build_api_headers(api_token: Optional[str], marketplace_id: Optional[str]) -> dict:
+    headers = {"Accept": "application/json", "User-Agent": BASE_HEADERS["User-Agent"]}
+    if api_token:
+        headers["X-API-TOKEN"] = api_token
+    if marketplace_id:
+        headers["X-MARKETPLACE-ID"] = marketplace_id
+    return headers
+
+
+async def fetch_offer_via_api(
+    session: "aiohttp.ClientSession",
+    isbn: str,
+    api_base: str,
+    proxy: Optional[str],
+    api_token: Optional[str],
+    marketplace_id: Optional[str],
+) -> Tuple[Optional[float], str]:
+    aiohttp = _get_aiohttp()
+    endpoints = _build_api_endpoints(api_base, isbn)
+    headers = _build_api_headers(api_token, marketplace_id)
+    for endpoint in endpoints:
+        try:
+            async with session.get(
+                endpoint,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+                proxy=proxy,
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                payload = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+            continue
+        price = _extract_price_from_json(payload)
+        if price is not None:
+            return price, f"API_OK_{resp.status}"
+    return None, "API_NO_PRICE"
 
 
 async def fetch_one(
@@ -314,6 +425,11 @@ async def fetch_one(
     sem: asyncio.Semaphore,
     proxy: Optional[str] = None,
     use_playwright_fallback: bool = True,
+    use_jina_fallback: bool = False,
+    use_api_fallback: bool = False,
+    api_base: Optional[str] = None,
+    api_token: Optional[str] = None,
+    marketplace_id: Optional[str] = None,
 ) -> OfferResult:
     isbn = normalize_isbn(isbn)
     url = BASE_URL.format(isbn)
@@ -325,12 +441,37 @@ async def fetch_one(
             retries=3,
             proxy=proxy,
             use_playwright_fallback=use_playwright_fallback,
+            use_jina_fallback=use_jina_fallback,
         )
 
     if html is None:
+        if use_api_fallback and api_base:
+            price, api_status = await fetch_offer_via_api(
+                session,
+                isbn,
+                api_base,
+                proxy,
+                api_token,
+                marketplace_id,
+            )
+            if price is not None:
+                return OfferResult(isbn, url, True, price, None, api_status)
+            return OfferResult(isbn, url, False, None, None, api_status)
         return OfferResult(isbn, url, False, None, None, status)
 
-    return parse_offer_page(html, isbn, url)
+    parsed = parse_offer_page(html, isbn, url)
+    if parsed.prix_eur is None and use_api_fallback and api_base:
+        price, api_status = await fetch_offer_via_api(
+            session,
+            isbn,
+            api_base,
+            proxy,
+            api_token,
+            marketplace_id,
+        )
+        if price is not None:
+            return OfferResult(isbn, url, True, price, parsed.titre, api_status)
+    return parsed
 
 
 async def run(
@@ -339,6 +480,11 @@ async def run(
     proxy: Optional[str] = None,
     use_env_proxy: bool = False,
     use_playwright_fallback: bool = True,
+    use_jina_fallback: bool = False,
+    use_api_fallback: bool = False,
+    api_base: Optional[str] = None,
+    api_token: Optional[str] = None,
+    marketplace_id: Optional[str] = None,
 ) -> List[OfferResult]:
     aiohttp = _get_aiohttp()
     sem = asyncio.Semaphore(concurrency)
@@ -358,7 +504,18 @@ async def run(
         print(f"[DIAG] {diag} (si CONNECT_ERROR: réseau/DNS/filtrage probable)")
 
         tasks = [
-            fetch_one(session, isbn, sem, proxy=resolved_proxy, use_playwright_fallback=use_playwright_fallback)
+            fetch_one(
+                session,
+                isbn,
+                sem,
+                proxy=resolved_proxy,
+                use_playwright_fallback=use_playwright_fallback,
+                use_jina_fallback=use_jina_fallback,
+                use_api_fallback=use_api_fallback,
+                api_base=api_base,
+                api_token=api_token,
+                marketplace_id=marketplace_id,
+            )
             for isbn in isbns
             if normalize_isbn(isbn)
         ]
@@ -436,15 +593,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-price", type=float, default=8.0, help="Prix minimum en euros.")
     parser.add_argument("--concurrency", type=int, default=4, help="Nombre de requêtes parallèles.")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy HTTP(S) à utiliser.")
-    parser.add_argument(
+    proxy_group = parser.add_mutually_exclusive_group()
+    proxy_group.add_argument(
         "--use-env-proxy",
         action="store_true",
         help="Utiliser les variables d'environnement HTTP(S)_PROXY si disponibles.",
+    )
+    proxy_group.add_argument(
+        "--no-env-proxy",
+        action="store_true",
+        help="Ignorer les variables d'environnement HTTP(S)_PROXY.",
     )
     parser.add_argument(
         "--no-playwright",
         action="store_true",
         help="Désactiver le fallback Playwright.",
+    )
+    parser.add_argument(
+        "--use-jina",
+        action="store_true",
+        help="Utiliser le fallback r.jina.ai si Momox est bloqué par le proxy.",
+    )
+    parser.add_argument(
+        "--use-api",
+        action="store_true",
+        help="Essayer l'API Momox si le HTML ne fournit pas de prix.",
+    )
+    parser.add_argument(
+        "--api-base",
+        default=DEFAULT_API_BASE,
+        help="Base URL de l'API Momox (ex: https://www.momox.fr/api/v4).",
+    )
+    parser.add_argument(
+        "--api-host",
+        default=None,
+        help="Alias pour une base API alternative (ex: https://api.momox.de/api/v4).",
+    )
+    parser.add_argument(
+        "--api-token",
+        default=None,
+        help="Token API Momox (ou variable d'environnement MOMOX_API_TOKEN).",
+    )
+    parser.add_argument(
+        "--marketplace-id",
+        default=DEFAULT_MARKETPLACE_ID,
+        help="Marketplace Momox (ex: momox_fr, momox_de).",
     )
     parser.add_argument(
         "--save-reports",
@@ -471,13 +664,22 @@ def collect_isbns(args: argparse.Namespace) -> List[str]:
 def main() -> None:
     args = parse_args()
     isbns = collect_isbns(args)
+    env_proxy_available = bool(resolve_proxy(None, use_env_proxy=True))
+    use_env_proxy = args.use_env_proxy or (env_proxy_available and not args.no_env_proxy)
+    api_token = args.api_token or os.environ.get("MOMOX_API_TOKEN")
+    api_base = args.api_host or args.api_base or DEFAULT_API_BASE
     results = asyncio.run(
         run(
             isbns,
             concurrency=args.concurrency,
             proxy=args.proxy,
-            use_env_proxy=args.use_env_proxy,
+            use_env_proxy=use_env_proxy,
             use_playwright_fallback=not args.no_playwright,
+            use_jina_fallback=args.use_jina,
+            use_api_fallback=args.use_api,
+            api_base=api_base,
+            api_token=api_token,
+            marketplace_id=args.marketplace_id,
         )
     )
 

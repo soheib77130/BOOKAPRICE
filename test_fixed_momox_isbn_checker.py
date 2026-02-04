@@ -9,6 +9,10 @@ from fixed_momox_isbn_checker import (
     filter_expensive,
     load_isbns_from_file,
     normalize_isbn,
+    _build_api_endpoints,
+    _build_api_headers,
+    _extract_price_from_json,
+    extract_api_base,
     parse_offer_page,
 )
 
@@ -68,3 +72,25 @@ def test_parse_offer_page_price_from_jsonld():
     result = parse_offer_page(html, "9782070368228", "https://example.test")
     assert result.prix_eur == pytest.approx(9.50)
     assert result.statut == "OK"
+
+
+def test_extract_api_base():
+    html = 'root.MX_WEBAPP.apiUrl = "/api/v4";'
+    assert extract_api_base(html) == "https://www.momox.fr/api/v4"
+
+
+def test_build_api_endpoints():
+    endpoints = _build_api_endpoints("https://www.momox.fr/api/v4/", "9782757889978")
+    assert endpoints[0].endswith("/offer/9782757889978")
+    assert endpoints[-1].endswith("/media/offer?ean=9782757889978")
+
+
+def test_extract_price_from_json():
+    payload = {"data": {"offer": {"price": "9.90"}}}
+    assert _extract_price_from_json(payload) == pytest.approx(9.90)
+
+
+def test_build_api_headers():
+    headers = _build_api_headers("token123", "momox_de")
+    assert headers["X-API-TOKEN"] == "token123"
+    assert headers["X-MARKETPLACE-ID"] == "momox_de"

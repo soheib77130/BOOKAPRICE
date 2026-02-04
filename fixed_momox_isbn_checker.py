@@ -1,14 +1,24 @@
+import argparse
 import asyncio
 import json
 import os
 import re
 import socket
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple, TYPE_CHECKING
 
-import aiohttp
-from bs4 import BeautifulSoup
-import pandas as pd
+def _get_bs4():
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:
+        raise RuntimeError("beautifulsoup4 est requis pour parser le HTML. Installez-le via pip.") from exc
+    return BeautifulSoup
+
+
+if TYPE_CHECKING:
+    import aiohttp
+    from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.momox.fr/offer/{}"
 
@@ -56,7 +66,7 @@ def extract_price_eur(text: str) -> Optional[float]:
     return float(m.group(1).replace(",", "."))
 
 
-def extract_json_ld_price(soup: BeautifulSoup) -> Optional[float]:
+def extract_json_ld_price(soup: "BeautifulSoup") -> Optional[float]:
     scripts = soup.find_all("script", {"type": "application/ld+json"})
     for script in scripts:
         raw = script.get_text(strip=True)
@@ -79,6 +89,7 @@ def extract_json_ld_price(soup: BeautifulSoup) -> Optional[float]:
 
 
 def parse_offer_page(html: str, isbn: str, url: str) -> OfferResult:
+    BeautifulSoup = _get_bs4()
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(strip=True) if soup.title else None
 
@@ -159,8 +170,17 @@ async def fetch_html_with_playwright(url: str, proxy: Optional[str] = None) -> T
     return None, error or "PLAYWRIGHT_UNKNOWN_ERROR"
 
 
-async def quick_connect_test(session: aiohttp.ClientSession, proxy: Optional[str]) -> str:
+def _get_aiohttp():
+    try:
+        import aiohttp
+    except ImportError as exc:
+        raise RuntimeError("aiohttp est requis pour lancer le scraping. Installez-le via pip.") from exc
+    return aiohttp
+
+
+async def quick_connect_test(session: "aiohttp.ClientSession", proxy: Optional[str]) -> str:
     """Test simple pour voir si on atteint momox."""
+    aiohttp = _get_aiohttp()
     test_url = BASE_URL.format("9782070368228")
     try:
         async with session.get(
@@ -197,8 +217,9 @@ def resolve_proxy(proxy: Optional[str], use_env_proxy: bool) -> Optional[str]:
     )
 
 
-async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str]) -> None:
+async def warmup_session(session: "aiohttp.ClientSession", proxy: Optional[str]) -> None:
     """Prépare la session en visitant la page d'accueil pour récupérer les cookies."""
+    aiohttp = _get_aiohttp()
     try:
         async with session.get(
             "https://www.momox.fr/",
@@ -212,7 +233,7 @@ async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str]) -
 
 
 async def fetch_html_with_retries(
-    session: aiohttp.ClientSession,
+    session: "aiohttp.ClientSession",
     url: str,
     retries: int = 3,
     proxy: Optional[str] = None,
@@ -227,6 +248,7 @@ async def fetch_html_with_retries(
     réessaie avec un léger backoff. Une stratégie de secours sans sous-domaine
     (momox.fr au lieu de www.momox.fr) est tentée si tous les essais échouent.
     """
+    aiohttp = _get_aiohttp()
     last_status = "UNKNOWN"
     # Liste de variantes d'URL à essayer (www.momox.fr puis momox.fr)
     variants = [url]
@@ -287,7 +309,7 @@ async def fetch_html_with_retries(
 
 
 async def fetch_one(
-    session: aiohttp.ClientSession,
+    session: "aiohttp.ClientSession",
     isbn: str,
     sem: asyncio.Semaphore,
     proxy: Optional[str] = None,
@@ -318,6 +340,7 @@ async def run(
     use_env_proxy: bool = False,
     use_playwright_fallback: bool = True,
 ) -> List[OfferResult]:
+    aiohttp = _get_aiohttp()
     sem = asyncio.Semaphore(concurrency)
     resolved_proxy = resolve_proxy(proxy, use_env_proxy)
 
@@ -343,6 +366,8 @@ async def run(
 
 
 def save_reports(results: List[OfferResult], csv_path: str = "momox_report.csv", html_path: str = "momox_report.html"):
+    import pandas as pd
+
     df = pd.DataFrame([asdict(r) for r in results])
 
     # tri: prix décroissant, puis racheté
@@ -367,12 +392,101 @@ def save_reports(results: List[OfferResult], csv_path: str = "momox_report.csv",
     print(f"✅ HTML: {html_path}")
 
 
-if __name__ == "__main__":
-    ISBN_LIST = [
-        "9782070368228",
-        "9782253006329",
-        "9782749948571",
-    ]
+def load_isbns_from_file(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Fichier introuvable: {path}")
+    raw = path.read_text(encoding="utf-8")
+    tokens = re.split(r"[,\s;]+", raw.strip())
+    return [t for t in (normalize_isbn(tok) for tok in tokens) if t]
 
-    results = asyncio.run(run(ISBN_LIST, concurrency=4))
-    save_reports(results)
+
+def filter_expensive(results: Iterable[OfferResult], min_price: float) -> List[OfferResult]:
+    filtered = [r for r in results if r.prix_eur is not None and r.prix_eur > min_price]
+    return sorted(filtered, key=lambda r: r.prix_eur or 0, reverse=True)
+
+
+def render_expensive_table(results: Iterable[OfferResult]) -> str:
+    rows = [r for r in results]
+    if not rows:
+        return "Aucun livre au-dessus du seuil demandé."
+    lines = ["ISBN | Prix (€) | Titre | URL", "--- | ---: | --- | ---"]
+    for r in rows:
+        title = r.titre or "-"
+        price = f"{r.prix_eur:.2f}" if r.prix_eur is not None else "-"
+        lines.append(f"{r.isbn} | {price} | {title} | {r.url}")
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape momox.fr pour récupérer les prix de rachat par ISBN.",
+    )
+    parser.add_argument(
+        "--isbns",
+        nargs="*",
+        default=None,
+        help="Liste d'ISBN séparés par des espaces.",
+    )
+    parser.add_argument(
+        "--isbn-file",
+        type=Path,
+        default=None,
+        help="Fichier contenant une liste d'ISBN (séparés par espaces, virgules ou retours à la ligne).",
+    )
+    parser.add_argument("--min-price", type=float, default=8.0, help="Prix minimum en euros.")
+    parser.add_argument("--concurrency", type=int, default=4, help="Nombre de requêtes parallèles.")
+    parser.add_argument("--proxy", type=str, default=None, help="Proxy HTTP(S) à utiliser.")
+    parser.add_argument(
+        "--use-env-proxy",
+        action="store_true",
+        help="Utiliser les variables d'environnement HTTP(S)_PROXY si disponibles.",
+    )
+    parser.add_argument(
+        "--no-playwright",
+        action="store_true",
+        help="Désactiver le fallback Playwright.",
+    )
+    parser.add_argument(
+        "--save-reports",
+        action="store_true",
+        help="Génère les rapports CSV/HTML complets.",
+    )
+    parser.add_argument("--csv-path", default="momox_report.csv", help="Chemin du CSV de sortie.")
+    parser.add_argument("--html-path", default="momox_report.html", help="Chemin du HTML de sortie.")
+    return parser.parse_args()
+
+
+def collect_isbns(args: argparse.Namespace) -> List[str]:
+    isbns: List[str] = []
+    if args.isbn_file:
+        isbns.extend(load_isbns_from_file(args.isbn_file))
+    if args.isbns:
+        isbns.extend(normalize_isbn(isbn) for isbn in args.isbns)
+    isbns = [isbn for isbn in isbns if isbn]
+    if not isbns:
+        raise ValueError("Aucun ISBN fourni. Utilisez --isbns ou --isbn-file.")
+    return isbns
+
+
+def main() -> None:
+    args = parse_args()
+    isbns = collect_isbns(args)
+    results = asyncio.run(
+        run(
+            isbns,
+            concurrency=args.concurrency,
+            proxy=args.proxy,
+            use_env_proxy=args.use_env_proxy,
+            use_playwright_fallback=not args.no_playwright,
+        )
+    )
+
+    expensive = filter_expensive(results, args.min_price)
+    print(render_expensive_table(expensive))
+
+    if args.save_reports:
+        save_reports(results, csv_path=args.csv_path, html_path=args.html_path)
+
+
+if __name__ == "__main__":
+    main()

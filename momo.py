@@ -12,7 +12,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.service import Service
 
 
-# ===================== TELEGRAM =====================
 TELEGRAM_TOKEN = "7987151223:AAHKtQldEIJZErrm4z2nrRKsnjGRnl99o80"
 TELEGRAM_CHAT_ID = "-1003833683489"
 
@@ -22,18 +21,13 @@ OUTPUT_CSV = "resultats_momox.csv"
 BASE_HOME = "https://www.momox.fr/"
 BASE_OFFER = "https://www.momox.fr/offer/{}"
 
-# Parallélisme (2 conseillé sur petit VPS)
 WORKERS = 2
-
-# Timeouts (plus courts = plus rapide, mais pas trop agressif)
-WAIT_SECONDS = 14
-DOM_READY_SECONDS = 10
+WAIT_SECONDS = 12
 
 
-# ===================== TELEGRAM HELPERS =====================
 def tg_send_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELELEGRAM_CHAT_ID if False else TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
 
 
 def tg_send_file(path: str, caption: str = ""):
@@ -47,15 +41,14 @@ def tg_send_file(path: str, caption: str = ""):
         )
 
 
-# ===================== SCRAPING HELPERS =====================
-def accept_cookies_shadow(driver, timeout=10):
+def accept_cookies_shadow(driver, timeout=8):
     end = time.time() + timeout
     while time.time() < end:
         clicked = driver.execute_script("""
             const host = document.querySelector('#cmpwrapper');
             if (!host || !host.shadowRoot) return false;
             const root = host.shadowRoot;
-            const spanTxt = root.querySelector('#cmpbntyestxt'); // OK, compris !
+            const spanTxt = root.querySelector('#cmpbntyestxt');
             if (!spanTxt) return false;
             const btn = spanTxt.closest('a');
             if (!btn) return false;
@@ -65,19 +58,7 @@ def accept_cookies_shadow(driver, timeout=10):
         """)
         if clicked:
             return True
-        time.sleep(0.12)
-    return False
-
-
-def wait_dom_ready(driver, wait_seconds=DOM_READY_SECONDS):
-    end = time.time() + wait_seconds
-    while time.time() < end:
-        try:
-            if driver.execute_script("return document.readyState") == "complete":
-                return True
-        except Exception:
-            pass
-        time.sleep(0.08)
+        time.sleep(0.10)
     return False
 
 
@@ -121,10 +102,9 @@ def price_to_float(price_str: str) -> float:
 
 
 def extract_main_price(driver, wait) -> str:
-    # attendre bouton principal = page "offer" prête
     wait.until(lambda d: d.find_elements(By.ID, "buttonAddToCart"))
 
-    # IMPORTANT: dès que le bloc est là, on stoppe le chargement pour accélérer
+    # stop loading ASAP
     try:
         driver.execute_script("window.stop();")
     except Exception:
@@ -147,16 +127,17 @@ def extract_main_price(driver, wait) -> str:
     return (price_el.text or "").strip()
 
 
-# ===================== DRIVER =====================
-def make_driver():
+def make_driver(worker_id: int):
     options = webdriver.ChromeOptions()
-
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=fr-FR")
+
+    # EAGER = ne pas attendre images/scripts etc
+    options.page_load_strategy = "eager"
 
     options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -168,7 +149,10 @@ def make_driver():
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # PERF: bloquer images/fonts/css
+    # Profil persistant par worker (cookies consent)
+    options.add_argument(f"--user-data-dir=/tmp/momox_profile_{worker_id}")
+
+    # prefs perf
     prefs = {
         "profile.managed_default_content_settings.images": 2,
         "profile.managed_default_content_settings.stylesheets": 2,
@@ -183,55 +167,65 @@ def make_driver():
         or which("google-chrome-stable")
     )
     driver_path = which("chromedriver")
-
     if not chrome_path:
-        raise RuntimeError("Chrome/Chromium introuvable (sur VPS, installe chromium).")
+        raise RuntimeError("Chrome/Chromium introuvable.")
     if not driver_path:
-        raise RuntimeError("chromedriver introuvable (installe chromium-driver).")
+        raise RuntimeError("chromedriver introuvable.")
 
     options.binary_location = chrome_path
     service = Service(driver_path)
 
     driver = webdriver.Chrome(service=service, options=options)
+
+    # block heavy resources + trackers
+    driver.execute_cdp_cmd("Network.enable", {})
+    driver.execute_cdp_cmd("Network.setBlockedURLs", {
+        "urls": [
+            "*.png","*.jpg","*.jpeg","*.gif","*.webp","*.svg",
+            "*.woff","*.woff2","*.ttf","*.css",
+            "*doubleclick*","*googlesyndication*","*google-analytics*","*googletagmanager*","*gtm*"
+        ]
+    })
+
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"}
     )
 
-    driver.set_page_load_timeout(25)
+    driver.set_page_load_timeout(18)
     return driver
 
 
-# ===================== WORKER =====================
-def run_batch(isbns_chunk):
-    driver = make_driver()
+def run_batch(args):
+    worker_id, isbns_chunk = args
+    driver = make_driver(worker_id)
     wait = WebDriverWait(driver, WAIT_SECONDS)
 
     bought_local = []
     try:
         driver.get(BASE_HOME)
-        wait_dom_ready(driver, DOM_READY_SECONDS)
-        accept_cookies_shadow(driver, 12)
+        accept_cookies_shadow(driver, 10)
 
         for isbn in isbns_chunk:
             driver.get(BASE_OFFER.format(isbn))
-            wait_dom_ready(driver, DOM_READY_SECONDS)
-            accept_cookies_shadow(driver, 3)
+            accept_cookies_shadow(driver, 2)
 
             if not ensure_offer_page(driver, isbn):
-                # retry rapide
                 driver.get(BASE_OFFER.format(isbn))
-                wait_dom_ready(driver, DOM_READY_SECONDS)
-                accept_cookies_shadow(driver, 3)
-
+                accept_cookies_shadow(driver, 2)
             if not ensure_offer_page(driver, isbn):
+                continue
+
+            # wait only what we need: either buy button OR not-bought text
+            try:
+                wait.until(lambda d: d.find_elements(By.ID, "buttonAddToCart") or "Nous n’achetons malheureusement pas" in d.page_source)
+            except Exception:
                 continue
 
             if is_not_bought_message_present(driver):
                 continue
 
             title = extract_title(driver)
-
             try:
                 price_str = extract_main_price(driver, wait)
                 val = price_to_float(price_str)
@@ -249,31 +243,27 @@ def run_batch(isbns_chunk):
     return bought_local
 
 
-# ===================== MAIN =====================
 def main():
     if not Path(ISBN_FILE).exists():
         tg_send_message("❌ isbns.txt introuvable sur le serveur.")
-        print("isbns.txt introuvable")
         return
 
     isbns = [l.strip() for l in Path(ISBN_FILE).read_text(encoding="utf-8").splitlines() if l.strip()]
     if not isbns:
         tg_send_message("❌ isbns.txt est vide.")
-        print("isbns.txt vide")
         return
 
     workers = max(1, min(WORKERS, cpu_count()))
     tg_send_message(f"🔄 Analyse en cours… ({len(isbns)} ISBN) | Workers: {workers}")
 
-    # Split en chunks équilibrés
     chunks = [isbns[i::workers] for i in range(workers)]
+    args = [(idx, chunks[idx]) for idx in range(workers)]
 
     all_bought = []
     with Pool(processes=workers) as pool:
-        for result in pool.map(run_batch, chunks):
+        for result in pool.map(run_batch, args):
             all_bought.extend(result)
 
-    # Trier + CSV
     all_bought.sort(key=lambda x: x[2], reverse=True)
 
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
